@@ -1,7 +1,11 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use eframe::egui;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
 const DEFAULT_CATALOG_URL: &str = "https://retrogamesets.fr/rgsx/manager/rgsx_catalog_api.php";
@@ -18,7 +22,7 @@ struct Cli {
     #[arg(long, global = true, env = "RGSX_CATALOG_SYNC_URL")]
     catalog_url: Option<String>,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -69,7 +73,7 @@ struct Platform {
     folder: String,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 struct Game {
     #[serde(default)]
     name: String,
@@ -90,7 +94,8 @@ async fn main() -> Result<()> {
         .build()
         .context("Could not initialize HTTP client")?;
 
-    match cli.command {
+    if let Some(command) = cli.command {
+        match command {
         Command::Platforms => {
             for platform in
                 fetch_pages::<Platform>(&client, &catalog_url, "platforms", None).await?
@@ -127,8 +132,15 @@ async fn main() -> Result<()> {
             let games =
                 fetch_pages::<Game>(&client, &catalog_url, "games", Some(platform.id)).await?;
             let game = resolve_game(&games, &game)?;
-            download_game(&client, &game, &output, overwrite).await?;
+            download_game(&client, &game, &output, overwrite, |bytes| {
+                eprint!("\rDownloaded {bytes} bytes")
+            })
+            .await?;
+            eprintln!("\nSaved to {}", output.join(safe_filename(&game.name)).display());
         }
+        }
+    } else {
+        launch_gui(client, catalog_url)?;
     }
     Ok(())
 }
@@ -265,6 +277,7 @@ async fn download_game(
     game: &Game,
     output_dir: &Path,
     overwrite: bool,
+    mut on_progress: impl FnMut(u64),
 ) -> Result<()> {
     let url = reqwest::Url::parse(&game.url).context("Game has an invalid download URL")?;
     if !matches!(url.scheme(), "http" | "https") {
@@ -305,7 +318,7 @@ async fn download_game(
                 .await
                 .context("Could not write download")?;
             downloaded += chunk.len() as u64;
-            eprint!("\rDownloaded {} bytes", downloaded);
+            on_progress(downloaded);
         }
         file.flush()
             .await
@@ -383,7 +396,6 @@ async fn download_game(
         let _ = tokio::fs::remove_file(&temporary).await;
     }
     result?;
-    eprintln!("\nSaved to {}", destination.display());
     Ok(())
 }
 
@@ -405,6 +417,260 @@ fn safe_filename(name: &str) -> String {
     } else {
         sanitized.to_owned()
     }
+}
+
+enum GuiMessage {
+    Platforms(std::result::Result<Vec<Platform>, String>),
+    Games(std::result::Result<Vec<Game>, String>),
+    DownloadProgress(u64),
+    DownloadFinished(std::result::Result<PathBuf, String>),
+}
+
+struct GuiApp {
+    client: reqwest::Client,
+    catalog_url: String,
+    platforms: Vec<Platform>,
+    selected_platform_id: Option<i64>,
+    games: Vec<Game>,
+    search: String,
+    output_dir: String,
+    status: String,
+    downloading: bool,
+    sender: Sender<GuiMessage>,
+    receiver: Receiver<GuiMessage>,
+}
+
+impl GuiApp {
+    fn new(client: reqwest::Client, catalog_url: String) -> Self {
+        let (sender, receiver) = mpsc::channel();
+        let mut app = Self {
+            client,
+            catalog_url,
+            platforms: Vec::new(),
+            selected_platform_id: None,
+            games: Vec::new(),
+            search: String::new(),
+            output_dir: ".".to_owned(),
+            status: "Loading catalog…".to_owned(),
+            downloading: false,
+            sender,
+            receiver,
+        };
+        app.load_platforms();
+        app
+    }
+
+    fn load_platforms(&mut self) {
+        self.status = "Loading platforms…".to_owned();
+        let client = self.client.clone();
+        let endpoint = self.catalog_url.clone();
+        let sender = self.sender.clone();
+        spawn_gui_task(async move {
+            let result = fetch_pages::<Platform>(&client, &endpoint, "platforms", None)
+                .await
+                .map_err(|error| format!("{error:#}"));
+            let _ = sender.send(GuiMessage::Platforms(result));
+        });
+    }
+
+    fn load_games(&mut self, platform_id: i64) {
+        self.games.clear();
+        self.status = "Loading games…".to_owned();
+        let client = self.client.clone();
+        let endpoint = self.catalog_url.clone();
+        let sender = self.sender.clone();
+        spawn_gui_task(async move {
+            let result =
+                fetch_pages::<Game>(&client, &endpoint, "games", Some(platform_id))
+                    .await
+                    .map_err(|error| format!("{error:#}"));
+            let _ = sender.send(GuiMessage::Games(result));
+        });
+    }
+
+    fn start_download(&mut self, game: Game) {
+        let output_dir = PathBuf::from(self.output_dir.trim());
+        if output_dir.as_os_str().is_empty() {
+            self.status = "Choose a download folder first.".to_owned();
+            return;
+        }
+        self.downloading = true;
+        self.status = format!("Starting download: {}", game.name);
+        let client = self.client.clone();
+        let sender = self.sender.clone();
+        spawn_gui_task(async move {
+            let destination = output_dir.join(safe_filename(&game.name));
+            let progress_sender = sender.clone();
+            let mut last_reported = 0;
+            let result = download_game(&client, &game, &output_dir, false, move |bytes| {
+                if bytes >= last_reported + 512 * 1024 {
+                    last_reported = bytes;
+                    let _ = progress_sender.send(GuiMessage::DownloadProgress(bytes));
+                }
+            })
+            .await
+            .map(|()| destination)
+            .map_err(|error| format!("{error:#}"));
+            let _ = sender.send(GuiMessage::DownloadFinished(result));
+        });
+    }
+
+    fn receive_messages(&mut self) {
+        while let Ok(message) = self.receiver.try_recv() {
+            match message {
+                GuiMessage::Platforms(Ok(platforms)) => {
+                    self.platforms = platforms;
+                    if !self.platforms.iter().any(|platform| {
+                        Some(platform.id) == self.selected_platform_id
+                    }) {
+                        self.selected_platform_id = self.platforms.first().map(|p| p.id);
+                    }
+                    if let Some(id) = self.selected_platform_id {
+                        self.load_games(id);
+                    } else {
+                        self.status = "The catalog has no platforms.".to_owned();
+                    }
+                }
+                GuiMessage::Platforms(Err(error)) | GuiMessage::Games(Err(error)) => {
+                    self.status = error;
+                }
+                GuiMessage::Games(Ok(games)) => {
+                    self.games = games;
+                    self.status = format!("{} games loaded.", self.games.len());
+                }
+                GuiMessage::DownloadProgress(bytes) => {
+                    self.status = format!("Downloading… {bytes} bytes received");
+                }
+                GuiMessage::DownloadFinished(Ok(path)) => {
+                    self.downloading = false;
+                    self.status = format!("Download saved to {}", path.display());
+                }
+                GuiMessage::DownloadFinished(Err(error)) => {
+                    self.downloading = false;
+                    self.status = format!("Download failed: {error}");
+                }
+            }
+        }
+    }
+}
+
+impl eframe::App for GuiApp {
+    fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+        self.receive_messages();
+        context.request_repaint_after(Duration::from_millis(100));
+
+        let mut requested_download = None;
+        let previous_platform = self.selected_platform_id;
+        egui::CentralPanel::default().show(context, |ui| {
+            ui.heading("RGSX — Retro Game Sets Xtra");
+            ui.label("Browse the catalog and download directly to your chosen folder.");
+            ui.separator();
+
+            ui.horizontal(|ui| {
+                ui.label("Platform");
+                let selected_name = self
+                    .platforms
+                    .iter()
+                    .find(|platform| Some(platform.id) == self.selected_platform_id)
+                    .map(|platform| platform.platform_name.as_str())
+                    .unwrap_or("Select a platform");
+                egui::ComboBox::from_id_salt("platform-picker")
+                    .selected_text(selected_name)
+                    .show_ui(ui, |ui| {
+                        for platform in &self.platforms {
+                            ui.selectable_value(
+                                &mut self.selected_platform_id,
+                                Some(platform.id),
+                                &platform.platform_name,
+                            );
+                        }
+                    });
+                if ui.button("Refresh").clicked() {
+                    self.load_platforms();
+                }
+            });
+
+            if previous_platform != self.selected_platform_id {
+                if let Some(id) = self.selected_platform_id {
+                    self.load_games(id);
+                }
+            }
+
+            ui.horizontal(|ui| {
+                ui.label("Search");
+                ui.text_edit_singleline(&mut self.search);
+            });
+            ui.horizontal(|ui| {
+                ui.label("Download folder");
+                ui.text_edit_singleline(&mut self.output_dir);
+            });
+            ui.separator();
+
+            let query = self.search.trim().to_lowercase();
+            let visible_games: Vec<_> = self
+                .games
+                .iter()
+                .filter(|game| query.is_empty() || game.name.to_lowercase().contains(&query))
+                .cloned()
+                .collect();
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for game in visible_games {
+                        ui.horizontal(|ui| {
+                            ui.label(&game.name);
+                            if !game.size.is_empty() {
+                                ui.label(&game.size);
+                            }
+                            let can_download = !self.downloading && !game.url.is_empty();
+                            if ui
+                                .add_enabled(can_download, egui::Button::new("Download"))
+                                .clicked()
+                            {
+                                requested_download = Some(game.clone());
+                            }
+                        });
+                        ui.separator();
+                    }
+                });
+
+            ui.label(&self.status);
+            if self.games.is_empty() && self.selected_platform_id.is_some() {
+                ui.label("No games loaded yet.");
+            } else if visible_games.is_empty() {
+                ui.label("No games match this search.");
+            }
+        });
+
+        if let Some(game) = requested_download {
+            self.start_download(game);
+        }
+    }
+}
+
+fn spawn_gui_task(future: impl std::future::Future<Output = ()> + Send + 'static) {
+    thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("could not create GUI worker runtime");
+        runtime.block_on(future);
+    });
+}
+
+fn launch_gui(client: reqwest::Client, catalog_url: String) -> Result<()> {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([900.0, 700.0])
+            .with_min_inner_size([600.0, 400.0]),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "RGSX",
+        options,
+        Box::new(move |_creation_context| Ok(Box::new(GuiApp::new(client, catalog_url)))),
+    )
+    .map_err(|error| anyhow::anyhow!("Could not start RGSX GUI: {error}"))
 }
 
 #[cfg(test)]
