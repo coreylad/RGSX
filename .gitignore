@@ -7,3 +7,4 @@ windows/logs/
 *.rar
 .vscode/
 .venv/
+/rust-app/target/
