@@ -1,16 +1,18 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 
-const DEFAULT_CATALOG_URL: &str =
-    "https://retrogamesets.fr/rgsx/manager/rgsx_catalog_api.php";
+const DEFAULT_CATALOG_URL: &str = "https://retrogamesets.fr/rgsx/manager/rgsx_catalog_api.php";
 const CATALOG_PAGE_SIZE: u64 = 1000;
 const MAX_CATALOG_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Parser)]
-#[command(version, about = "Standalone RGSX catalog browser and direct downloader")]
+#[command(
+    version,
+    about = "Standalone RGSX catalog browser and direct downloader"
+)]
 struct Cli {
     /// Catalog API endpoint (or set RGSX_CATALOG_SYNC_URL).
     #[arg(long, global = true, env = "RGSX_CATALOG_SYNC_URL")]
@@ -58,7 +60,7 @@ struct ApiResponse<T> {
     error: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 struct Platform {
     id: i64,
     #[serde(default)]
@@ -67,7 +69,7 @@ struct Platform {
     folder: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct Game {
     #[serde(default)]
     name: String,
@@ -90,7 +92,8 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Platforms => {
-            for platform in fetch_pages::<Platform>(&client, &catalog_url, "platforms", None).await?
+            for platform in
+                fetch_pages::<Platform>(&client, &catalog_url, "platforms", None).await?
             {
                 println!(
                     "{}\t{}\t{}",
@@ -99,10 +102,9 @@ async fn main() -> Result<()> {
             }
         }
         Command::Games { platform, search } => {
-            let platform = resolve_platform(
-                &fetch_pages::<Platform>(&client, &catalog_url, "platforms", None).await?,
-                &platform,
-            )?;
+            let platforms =
+                fetch_pages::<Platform>(&client, &catalog_url, "platforms", None).await?;
+            let platform = resolve_platform(&platforms, &platform)?;
             let games =
                 fetch_pages::<Game>(&client, &catalog_url, "games", Some(platform.id)).await?;
             for game in games.into_iter().filter(|game| {
@@ -119,10 +121,9 @@ async fn main() -> Result<()> {
             output,
             overwrite,
         } => {
-            let platform = resolve_platform(
-                &fetch_pages::<Platform>(&client, &catalog_url, "platforms", None).await?,
-                &platform,
-            )?;
+            let platforms =
+                fetch_pages::<Platform>(&client, &catalog_url, "platforms", None).await?;
+            let platform = resolve_platform(&platforms, &platform)?;
             let games =
                 fetch_pages::<Game>(&client, &catalog_url, "games", Some(platform.id)).await?;
             let game = resolve_game(&games, &game)?;
@@ -132,7 +133,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn fetch_pages<T: for<'de> Deserialize<'de>>(
+async fn fetch_pages<T: for<'de> Deserialize<'de> + Default>(
     client: &reqwest::Client,
     endpoint: &str,
     entity: &str,
@@ -141,30 +142,32 @@ async fn fetch_pages<T: for<'de> Deserialize<'de>>(
     let mut items = Vec::new();
     let mut cursor = 0;
     loop {
-        let mut request = client
-            .get(endpoint)
-            .query(&[
-                ("action", "snapshot".to_owned()),
-                ("entity", entity.to_owned()),
-                ("after", cursor.to_string()),
-                ("limit", CATALOG_PAGE_SIZE.to_string()),
-            ]);
+        let mut request = client.get(endpoint).query(&[
+            ("action", "snapshot".to_owned()),
+            ("entity", entity.to_owned()),
+            ("after", cursor.to_string()),
+            ("limit", CATALOG_PAGE_SIZE.to_string()),
+        ]);
         if let Some(id) = platform_id {
             request = request.query(&[("platform_id", id.to_string())]);
         }
 
-        let response = request
+        let mut response = request
             .send()
             .await
             .with_context(|| format!("Could not fetch {entity} catalog"))?
             .error_for_status()
             .with_context(|| format!("Catalog rejected the {entity} request"))?;
-        let bytes = response
-            .bytes()
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .with_context(|| format!("Could not read {entity} catalog response"))?;
-        if bytes.len() > MAX_CATALOG_RESPONSE_BYTES {
-            bail!("{entity} catalog page exceeds the 32 MiB response limit");
+            .with_context(|| format!("Could not read {entity} catalog response"))?
+        {
+            if bytes.len().saturating_add(chunk.len()) > MAX_CATALOG_RESPONSE_BYTES {
+                bail!("{entity} catalog page exceeds the 32 MiB response limit");
+            }
+            bytes.extend_from_slice(&chunk);
         }
         let page: ApiResponse<T> =
             serde_json::from_slice(&bytes).context("Catalog returned invalid JSON")?;
@@ -189,8 +192,11 @@ async fn fetch_pages<T: for<'de> Deserialize<'de>>(
     }
 }
 
-fn resolve_platform<'a>(platforms: &'a [Platform], query: &str) -> Result<&'a Platform> {
+fn resolve_platform(platforms: &[Platform], query: &str) -> Result<Platform> {
     let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        bail!("Platform name cannot be empty");
+    }
     let exact: Vec<_> = platforms
         .iter()
         .filter(|platform| {
@@ -210,7 +216,7 @@ fn resolve_platform<'a>(platforms: &'a [Platform], query: &str) -> Result<&'a Pl
         exact
     };
     match matches.as_slice() {
-        [platform] => Ok(platform),
+        [platform] => Ok((*platform).clone()),
         [] => bail!("Platform not found: {query}"),
         _ => bail!(
             "Platform name is ambiguous; use a more specific name: {}",
@@ -225,6 +231,9 @@ fn resolve_platform<'a>(platforms: &'a [Platform], query: &str) -> Result<&'a Pl
 
 fn resolve_game<'a>(games: &'a [Game], query: &str) -> Result<&'a Game> {
     let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        bail!("Game title cannot be empty");
+    }
     let exact: Vec<_> = games
         .iter()
         .filter(|game| game.name.to_lowercase() == query)
@@ -273,6 +282,11 @@ async fn download_game(
             destination.display()
         );
     }
+    if tokio::fs::try_exists(&destination).await?
+        && tokio::fs::metadata(&destination).await?.is_dir()
+    {
+        bail!("{} is a directory", destination.display());
+    }
     let temporary = output_dir.join(format!("{filename}.part-{}", std::process::id()));
     let result = async {
         let mut response = client
@@ -287,18 +301,80 @@ async fn download_game(
             .with_context(|| format!("Could not create {}", temporary.display()))?;
         let mut downloaded: u64 = 0;
         while let Some(chunk) = response.chunk().await.context("Download failed")? {
-            file.write_all(&chunk).await.context("Could not write download")?;
+            file.write_all(&chunk)
+                .await
+                .context("Could not write download")?;
             downloaded += chunk.len() as u64;
             eprint!("\rDownloaded {} bytes", downloaded);
         }
-        file.flush().await.context("Could not finish writing download")?;
+        file.flush()
+            .await
+            .context("Could not finish writing download")?;
         drop(file);
         if overwrite && tokio::fs::try_exists(&destination).await? {
-            tokio::fs::remove_file(&destination).await?;
+            let backup = output_dir.join(format!("{filename}.backup-{}", std::process::id()));
+            if tokio::fs::try_exists(&backup).await? {
+                bail!(
+                    "{} already exists; refusing to overwrite it",
+                    backup.display()
+                );
+            }
+            tokio::fs::rename(&destination, &backup)
+                .await
+                .with_context(|| format!("Could not preserve {}", destination.display()))?;
+            if let Err(error) = tokio::fs::rename(&temporary, &destination).await {
+                let restore = tokio::fs::rename(&backup, &destination).await;
+                if let Err(restore_error) = restore {
+                    bail!(
+                        "Could not save {} ({error}); previous file remains at {} ({restore_error})",
+                        destination.display(),
+                        backup.display()
+                    );
+                }
+                return Err(error)
+                    .with_context(|| format!("Could not save {}", destination.display()));
+            }
+            tokio::fs::remove_file(&backup)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Download saved, but could not remove {}",
+                        backup.display()
+                    )
+                })?;
+        } else if overwrite {
+            tokio::fs::rename(&temporary, &destination)
+                .await
+                .with_context(|| format!("Could not save {}", destination.display()))?;
+        } else {
+            let mut source = tokio::fs::File::open(&temporary).await?;
+            let mut target = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&destination)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Could not save {}; it may already exist",
+                        destination.display()
+                    )
+                })?;
+            if let Err(error) = tokio::io::copy(&mut source, &mut target).await {
+                drop(target);
+                let _ = tokio::fs::remove_file(&destination).await;
+                return Err(error).with_context(|| {
+                    format!("Could not write download to {}", destination.display())
+                });
+            }
+            if let Err(error) = target.flush().await {
+                drop(target);
+                let _ = tokio::fs::remove_file(&destination).await;
+                return Err(error)
+                    .with_context(|| format!("Could not finish writing {}", destination.display()));
+            }
+            drop(target);
+            tokio::fs::remove_file(&temporary).await?;
         }
-        tokio::fs::rename(&temporary, &destination)
-            .await
-            .with_context(|| format!("Could not save {}", destination.display()))?;
         Ok::<_, anyhow::Error>(())
     }
     .await;
@@ -359,6 +435,7 @@ mod tests {
         ];
         assert_eq!(resolve_platform(&platforms, "NES").unwrap().id, 1);
         assert!(resolve_platform(&platforms, "nintendo").is_err());
+        assert!(resolve_platform(&platforms, " ").is_err());
     }
 
     #[test]
@@ -377,5 +454,6 @@ mod tests {
         ];
         assert_eq!(resolve_game(&games, "example").unwrap().name, "Example");
         assert!(resolve_game(&games, "exam").is_err());
+        assert!(resolve_game(&games, " ").is_err());
     }
 }
