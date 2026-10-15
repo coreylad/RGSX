@@ -96,48 +96,51 @@ async fn main() -> Result<()> {
 
     if let Some(command) = cli.command {
         match command {
-        Command::Platforms => {
-            for platform in
-                fetch_pages::<Platform>(&client, &catalog_url, "platforms", None).await?
-            {
-                println!(
-                    "{}\t{}\t{}",
-                    platform.platform_name, platform.folder, platform.id
+            Command::Platforms => {
+                for platform in
+                    fetch_pages::<Platform>(&client, &catalog_url, "platforms", None).await?
+                {
+                    println!(
+                        "{}\t{}\t{}",
+                        platform.platform_name, platform.folder, platform.id
+                    );
+                }
+            }
+            Command::Games { platform, search } => {
+                let platforms =
+                    fetch_pages::<Platform>(&client, &catalog_url, "platforms", None).await?;
+                let platform = resolve_platform(&platforms, &platform)?;
+                let games =
+                    fetch_pages::<Game>(&client, &catalog_url, "games", Some(platform.id)).await?;
+                for game in games.into_iter().filter(|game| {
+                    search.as_ref().is_none_or(|query| {
+                        game.name.to_lowercase().contains(&query.to_lowercase())
+                    })
+                }) {
+                    println!("{}\t{}", game.name, game.size);
+                }
+            }
+            Command::Download {
+                platform,
+                game,
+                output,
+                overwrite,
+            } => {
+                let platforms =
+                    fetch_pages::<Platform>(&client, &catalog_url, "platforms", None).await?;
+                let platform = resolve_platform(&platforms, &platform)?;
+                let games =
+                    fetch_pages::<Game>(&client, &catalog_url, "games", Some(platform.id)).await?;
+                let game = resolve_game(&games, &game)?;
+                download_game(&client, &game, &output, overwrite, |bytes| {
+                    eprint!("\rDownloaded {bytes} bytes")
+                })
+                .await?;
+                eprintln!(
+                    "\nSaved to {}",
+                    output.join(safe_filename(&game.name)).display()
                 );
             }
-        }
-        Command::Games { platform, search } => {
-            let platforms =
-                fetch_pages::<Platform>(&client, &catalog_url, "platforms", None).await?;
-            let platform = resolve_platform(&platforms, &platform)?;
-            let games =
-                fetch_pages::<Game>(&client, &catalog_url, "games", Some(platform.id)).await?;
-            for game in games.into_iter().filter(|game| {
-                search
-                    .as_ref()
-                    .is_none_or(|query| game.name.to_lowercase().contains(&query.to_lowercase()))
-            }) {
-                println!("{}\t{}", game.name, game.size);
-            }
-        }
-        Command::Download {
-            platform,
-            game,
-            output,
-            overwrite,
-        } => {
-            let platforms =
-                fetch_pages::<Platform>(&client, &catalog_url, "platforms", None).await?;
-            let platform = resolve_platform(&platforms, &platform)?;
-            let games =
-                fetch_pages::<Game>(&client, &catalog_url, "games", Some(platform.id)).await?;
-            let game = resolve_game(&games, &game)?;
-            download_game(&client, &game, &output, overwrite, |bytes| {
-                eprint!("\rDownloaded {bytes} bytes")
-            })
-            .await?;
-            eprintln!("\nSaved to {}", output.join(safe_filename(&game.name)).display());
-        }
         }
     } else {
         launch_gui(client, catalog_url)?;
@@ -432,6 +435,7 @@ struct GuiApp {
     platforms: Vec<Platform>,
     selected_platform_id: Option<i64>,
     games: Vec<Game>,
+    games_loaded: bool,
     search: String,
     output_dir: String,
     status: String,
@@ -449,6 +453,7 @@ impl GuiApp {
             platforms: Vec::new(),
             selected_platform_id: None,
             games: Vec::new(),
+            games_loaded: false,
             search: String::new(),
             output_dir: ".".to_owned(),
             status: "Loading catalog…".to_owned(),
@@ -475,15 +480,15 @@ impl GuiApp {
 
     fn load_games(&mut self, platform_id: i64) {
         self.games.clear();
+        self.games_loaded = false;
         self.status = "Loading games…".to_owned();
         let client = self.client.clone();
         let endpoint = self.catalog_url.clone();
         let sender = self.sender.clone();
         spawn_gui_task(async move {
-            let result =
-                fetch_pages::<Game>(&client, &endpoint, "games", Some(platform_id))
-                    .await
-                    .map_err(|error| format!("{error:#}"));
+            let result = fetch_pages::<Game>(&client, &endpoint, "games", Some(platform_id))
+                .await
+                .map_err(|error| format!("{error:#}"));
             let _ = sender.send(GuiMessage::Games(result));
         });
     }
@@ -520,9 +525,11 @@ impl GuiApp {
             match message {
                 GuiMessage::Platforms(Ok(platforms)) => {
                     self.platforms = platforms;
-                    if !self.platforms.iter().any(|platform| {
-                        Some(platform.id) == self.selected_platform_id
-                    }) {
+                    if !self
+                        .platforms
+                        .iter()
+                        .any(|platform| Some(platform.id) == self.selected_platform_id)
+                    {
                         self.selected_platform_id = self.platforms.first().map(|p| p.id);
                     }
                     if let Some(id) = self.selected_platform_id {
@@ -536,6 +543,7 @@ impl GuiApp {
                 }
                 GuiMessage::Games(Ok(games)) => {
                     self.games = games;
+                    self.games_loaded = true;
                     self.status = format!("{} games loaded.", self.games.len());
                 }
                 GuiMessage::DownloadProgress(bytes) => {
@@ -555,13 +563,14 @@ impl GuiApp {
 }
 
 impl eframe::App for GuiApp {
-    fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.receive_messages();
+        let context = ui.ctx();
         context.request_repaint_after(Duration::from_millis(100));
 
         let mut requested_download = None;
         let previous_platform = self.selected_platform_id;
-        egui::CentralPanel::default().show(context, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             ui.heading("RGSX — Retro Game Sets Xtra");
             ui.label("Browse the catalog and download directly to your chosen folder.");
             ui.separator();
@@ -613,6 +622,7 @@ impl eframe::App for GuiApp {
                 .filter(|game| query.is_empty() || game.name.to_lowercase().contains(&query))
                 .cloned()
                 .collect();
+            let no_visible_games = visible_games.is_empty();
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
@@ -635,9 +645,11 @@ impl eframe::App for GuiApp {
                 });
 
             ui.label(&self.status);
-            if self.games.is_empty() && self.selected_platform_id.is_some() {
-                ui.label("No games loaded yet.");
-            } else if visible_games.is_empty() {
+            if !self.games_loaded && self.selected_platform_id.is_some() {
+                ui.label("Loading games…");
+            } else if self.games.is_empty() && self.games_loaded {
+                ui.label("No games in this platform.");
+            } else if no_visible_games {
                 ui.label("No games match this search.");
             }
         });

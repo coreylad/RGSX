@@ -30,10 +30,10 @@ window.
 ## Optional CLI
 
 ```sh
- rgsx platforms
- rgsx games --platform nes
- rgsx games --platform "Super Nintendo" --search "Mario"
- rgsx download --platform nes --game "Example Game.zip" --output ./roms
+rgsx platforms
+rgsx games --platform nes
+rgsx games --platform "Super Nintendo" --search "Mario"
+rgsx download --platform nes --game "Example Game.zip" --output ./roms
 ```
 
 `--platform` accepts a platform name or folder key. Ambiguous platform/game
