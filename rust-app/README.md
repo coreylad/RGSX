@@ -1,21 +1,26 @@
-# Standalone RGSX Rust CLI
+# Standalone RGSX Rust GUI and CLI
 
 This is a small, cross-platform Rust application with a native GUI for browsing
 the RGSX catalog and downloading direct HTTP(S) links. It does not require
 Batocera, Python, EmulationStation, or a local RGSX installation.
 
 It currently supports catalog platform listing, game listing/search, and direct
-downloads. It does not yet replace the graphical interface, web server,
+downloads. Its GUI does not yet replace the controller-first interface, web server,
 premium/debrid provider integrations, torrent backend, or Batocera-specific
 features of the existing application.
 
 ## Build and launch
 
-Install the Rust toolchain, then build and launch the GUI:
+For prebuilt 64-bit Windows executables, see the
+[Standalone Windows prereleases](https://github.com/coreylad/RGSX/releases).
+Every successful push build publishes `rgsx.exe` under a commit-specific
+`rust-<full-commit-SHA>` prerelease tag, separate from the legacy Python ZIP releases.
+
+Install the Rust toolchain, then build and launch the GUI from `rust-app/`:
 
 ```sh
-cargo build --release
-cargo run --release
+cargo build --release --locked
+cargo run --release --locked
 ```
 
 The binary is created at `target/release/rgsx` (or `rgsx.exe` on Windows).

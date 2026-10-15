@@ -1,0 +1,74 @@
+name: Build and release Windows executable
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-exe-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: rust-app
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.3.1
+
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --target x86_64-pc-windows-msvc
+          rustup default stable
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run tests
+        run: cargo test --locked --target x86_64-pc-windows-msvc
+
+      - name: Build executable
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: rgsx-windows-x86_64
+          path: rust-app/target/x86_64-pc-windows-msvc/release/rgsx.exe
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download executable
+        uses: actions/download-artifact@v4.3.0
+        with:
+          name: rgsx-windows-x86_64
+          path: dist
+
+      - name: Publish commit prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          TAG="rust-${COMMIT_SHA}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/rgsx.exe --clobber
+          else
+            gh release create "$TAG" dist/rgsx.exe \
+              --target "$COMMIT_SHA" \
+              --title "Standalone Windows ${COMMIT_SHA:0:12}" \
+              --notes "Development build of the standalone Rust GUI/CLI for Windows x86-64 at commit ${COMMIT_SHA}. Download rgsx.exe and run it; no Python installation is required. Supports catalog browsing and direct HTTP(S) downloads, not the legacy app's premium/debrid or torrent features." \
+              --prerelease \
+              --latest=false
+          fi
