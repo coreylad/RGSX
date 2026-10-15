@@ -8,15 +8,16 @@ use std::thread;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
+mod artwork;
+mod debrid;
+mod torrent;
+
 const DEFAULT_CATALOG_URL: &str = "https://retrogamesets.fr/rgsx/manager/rgsx_catalog_api.php";
 const CATALOG_PAGE_SIZE: u64 = 1000;
 const MAX_CATALOG_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Parser)]
-#[command(
-    version,
-    about = "Standalone RGSX catalog browser and direct downloader"
-)]
+#[command(version, about = "Standalone RGSX catalog browser and downloader")]
 struct Cli {
     /// Catalog API endpoint (or set RGSX_CATALOG_SYNC_URL).
     #[arg(long, global = true, env = "RGSX_CATALOG_SYNC_URL")]
@@ -48,6 +49,9 @@ enum Command {
         /// Replace a file with the same name if it already exists.
         #[arg(long)]
         overwrite: bool,
+        /// Hoster provider: direct, real-debrid, all-debrid, or debrid-link.
+        #[arg(long, env = "RGSX_DEBRID_PROVIDER", default_value = "direct", value_parser = parse_provider)]
+        provider: debrid::Provider,
     },
 }
 
@@ -81,6 +85,15 @@ struct Game {
     url: String,
     #[serde(default)]
     size: String,
+    #[serde(
+        default,
+        alias = "boxart",
+        alias = "boxart_url",
+        alias = "image_url",
+        alias = "cover_url",
+        alias = "thumbnail"
+    )]
+    artwork_url: String,
 }
 
 #[tokio::main]
@@ -127,6 +140,7 @@ async fn main() -> Result<()> {
                 game,
                 output,
                 overwrite,
+                provider,
             } => {
                 let platforms =
                     fetch_pages::<Platform>(&client, &catalog_url, "platforms", None).await?;
@@ -134,20 +148,76 @@ async fn main() -> Result<()> {
                 let games =
                     fetch_pages::<Game>(&client, &catalog_url, "games", Some(platform.id)).await?;
                 let game = resolve_game(&games, &game)?;
-                download_game(&client, &game, &output, overwrite, |bytes| {
-                    eprint!("\rDownloaded {bytes} bytes")
-                })
-                .await?;
-                eprintln!(
-                    "\nSaved to {}",
-                    output.join(safe_filename(&game.name)).display()
-                );
+                let settings = provider_settings(provider);
+                let destination =
+                    download_release(&client, game, &output, overwrite, &settings, |bytes| {
+                        eprint!("\rDownloaded {bytes} bytes")
+                    })
+                    .await?;
+                eprintln!("\nSaved to {}", destination.display());
             }
         }
     } else {
         launch_gui(client, catalog_url)?;
     }
     Ok(())
+}
+
+fn parse_provider(value: &str) -> std::result::Result<debrid::Provider, String> {
+    match value
+        .to_ascii_lowercase()
+        .replace(['-', '_', ' '], "")
+        .as_str()
+    {
+        "direct" => Ok(debrid::Provider::Direct),
+        "realdebrid" => Ok(debrid::Provider::RealDebrid),
+        "alldebrid" => Ok(debrid::Provider::AllDebrid),
+        "debridlink" => Ok(debrid::Provider::DebridLink),
+        _ => Err("Choose direct, real-debrid, all-debrid, or debrid-link".to_owned()),
+    }
+}
+
+fn provider_settings(provider: debrid::Provider) -> debrid::Settings {
+    let variable = match provider {
+        debrid::Provider::Direct => "",
+        debrid::Provider::RealDebrid => "RGSX_REAL_DEBRID_API_KEY",
+        debrid::Provider::AllDebrid => "RGSX_ALL_DEBRID_API_KEY",
+        debrid::Provider::DebridLink => "RGSX_DEBRID_LINK_API_KEY",
+    };
+    debrid::Settings {
+        provider,
+        api_key: std::env::var(variable)
+            .or_else(|_| std::env::var("RGSX_DEBRID_API_KEY"))
+            .unwrap_or_default(),
+    }
+}
+
+fn validate_download(value: &str) -> Result<()> {
+    if torrent::is_torrent(value) {
+        return torrent::validate(value);
+    }
+    download_url(value).map(|_| ())
+}
+
+async fn download_release(
+    client: &reqwest::Client,
+    game: &Game,
+    output: &Path,
+    overwrite: bool,
+    settings: &debrid::Settings,
+    on_progress: impl FnMut(u64),
+) -> Result<PathBuf> {
+    validate_download(&game.url)?;
+    if torrent::is_torrent(&game.url) {
+        return torrent::download(client, &game.url, output, &game.name, on_progress).await;
+    }
+    let resolved = debrid::resolve(client, settings, &game.url).await?;
+    let resolved_game = Game {
+        url: resolved,
+        ..game.clone()
+    };
+    download_game(client, &resolved_game, output, overwrite, on_progress).await?;
+    Ok(output.join(safe_filename(&game.name)))
 }
 
 async fn fetch_pages<T: for<'de> Deserialize<'de> + Default>(
@@ -321,7 +391,7 @@ async fn download_game(
                     || media_type.eq_ignore_ascii_case("application/xhtml+xml")
             })
         {
-            bail!("This link returned a web page, not a file. It may require a login or a provider integration that the standalone app does not support.");
+            bail!("This link returned a web page, not a file. Use a direct file link or configure a supported debrid provider in Settings (CLI: --provider).");
         }
         let mut file = tokio::fs::File::create(&temporary)
             .await
@@ -417,7 +487,10 @@ async fn download_game(
 fn download_url(value: &str) -> Result<reqwest::Url> {
     let url = reqwest::Url::parse(value.trim()).context("Game has an invalid download URL")?;
     if !matches!(url.scheme(), "http" | "https") {
-        bail!("Only direct HTTP(S) links are supported. Torrent and provider links require the legacy RGSX app.");
+        bail!("Use an HTTP(S) file or torrent URL, or a valid magnet link.");
+    }
+    if url.host_str().is_none() || !url.username().is_empty() || url.password().is_some() {
+        bail!("HTTP(S) download URL must have a host and no embedded credentials");
     }
     Ok(url)
 }
@@ -476,6 +549,8 @@ struct GuiApp {
     downloading: bool,
     tab: Tab,
     downloads: Vec<DownloadEntry>,
+    debrid: debrid::Settings,
+    artwork: artwork::ArtworkCache,
     sender: Sender<GuiMessage>,
     receiver: Receiver<GuiMessage>,
 }
@@ -496,6 +571,13 @@ impl GuiApp {
             downloading: false,
             tab: Tab::Catalog,
             downloads: Vec::new(),
+            debrid: provider_settings(
+                std::env::var("RGSX_DEBRID_PROVIDER")
+                    .ok()
+                    .and_then(|value| parse_provider(&value).ok())
+                    .unwrap_or(debrid::Provider::Direct),
+            ),
+            artwork: artwork::ArtworkCache::default(),
             sender,
             receiver,
         };
@@ -548,7 +630,7 @@ impl GuiApp {
                 "Choose a download folder in Settings first."
             ))
         } else {
-            download_url(&game.url).map(|_| ())
+            validate_download(&game.url)
         };
         if let Err(error) = validation {
             self.finish_download(Err(format!("{error:#}")));
@@ -558,12 +640,12 @@ impl GuiApp {
         self.status = format!("Starting download: {}", game.name);
         let client = self.client.clone();
         let sender = self.sender.clone();
+        let settings = self.debrid.clone();
         spawn_gui_task(async move {
-            let destination = output_dir.join(safe_filename(&game.name));
             let progress_sender = sender.clone();
             let mut last_reported = 0;
             let mut received = 0;
-            let result = download_game(&client, &game, &output_dir, false, |bytes| {
+            let result = download_release(&client, &game, &output_dir, false, &settings, |bytes| {
                 received = bytes;
                 if bytes >= last_reported + 512 * 1024 {
                     last_reported = bytes;
@@ -571,7 +653,6 @@ impl GuiApp {
                 }
             })
             .await
-            .map(|()| destination)
             .map_err(|error| format!("{error:#}"));
             let _ = sender.send(GuiMessage::DownloadProgress(received));
             let _ = sender.send(GuiMessage::DownloadFinished(result));
@@ -739,10 +820,16 @@ impl GuiApp {
         );
         ui.separator();
         let mut requested_download = None;
+        let platform = self
+            .platforms
+            .iter()
+            .find(|platform| Some(platform.id) == self.selected_platform_id)
+            .cloned()
+            .unwrap_or_default();
         egui::ScrollArea::vertical()
             .id_salt("catalog-list")
             .auto_shrink([false, false])
-            .show(ui, |ui| {
+            .show_rows(ui, 96.0, visible_games.len().max(1), |ui, range| {
                 if !self.games_loaded && self.selected_platform_id.is_some() {
                     ui.label("Loading games…");
                 } else if visible_games.is_empty() {
@@ -752,12 +839,16 @@ impl GuiApp {
                         "No games match this search."
                     });
                 }
-                for (index, game) in visible_games.into_iter().enumerate() {
+                for index in range {
+                    let Some(game) = visible_games.get(index) else {
+                        continue;
+                    };
                     ui.push_id(index, |ui| {
                         egui::Frame::group(ui.style())
                             .inner_margin(10.0)
                             .show(ui, |ui| {
                                 ui.set_width(ui.available_width());
+                                ui.set_min_height(72.0);
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
@@ -780,8 +871,9 @@ impl GuiApp {
                                             response
                                         };
                                         if response.clicked() {
-                                            requested_download = Some(game.clone());
+                                            requested_download = Some((*game).clone());
                                         }
+                                        self.artwork.show(ui, &self.client, &platform, game);
                                         ui.allocate_ui_with_layout(
                                             egui::vec2(ui.available_width(), 40.0),
                                             egui::Layout::top_down(egui::Align::Min),
@@ -877,7 +969,29 @@ impl GuiApp {
                 ui.label("Existing files are never replaced. Choose another folder or move an existing file before retrying.");
                 ui.add_space(16.0);
                 ui.label(egui::RichText::new("Supported links").strong());
-                ui.label("Direct HTTP(S) files only. Links requiring a provider login, debrid service, or torrent backend need the legacy RGSX app.");
+                ui.label("HTTP(S) files, .torrent URLs and magnet links. Torrents download natively; hoster links can use a debrid provider.");
+                ui.add_space(16.0);
+                ui.label(egui::RichText::new("Hoster provider").strong());
+                let previous = self.debrid.provider;
+                egui::ComboBox::from_id_salt("debrid-provider")
+                    .selected_text(self.debrid.provider.label())
+                    .show_ui(ui, |ui| {
+                        for provider in debrid::Provider::ALL {
+                            ui.selectable_value(&mut self.debrid.provider, provider, provider.label());
+                        }
+                    });
+                if previous != self.debrid.provider {
+                    self.debrid = provider_settings(self.debrid.provider);
+                }
+                if self.debrid.provider != debrid::Provider::Direct {
+                    ui.label("API key");
+                    ui.add(egui::TextEdit::singleline(&mut self.debrid.api_key)
+                        .password(true).desired_width(f32::INFINITY));
+                }
+                ui.label("Keys stay in memory for this session; they are never saved to disk. Environment variables are also supported.");
+                ui.add_space(16.0);
+                ui.label(egui::RichText::new("Box art").strong());
+                ui.label("Loaded on demand from catalog images or Libretro thumbnails for recognized systems. Missing artwork is shown as a placeholder.");
             });
     }
 }
@@ -949,6 +1063,7 @@ mod tests {
                 name: "A very long game title ".repeat(25),
                 url: "rgsx+torrent://unsupported".to_owned(),
                 size: "24 MiB".to_owned(),
+                ..Default::default()
             }],
             games_loaded: true,
             search: String::new(),
@@ -957,6 +1072,8 @@ mod tests {
             downloading: false,
             tab: Tab::Catalog,
             downloads: Vec::new(),
+            debrid: debrid::Settings::default(),
+            artwork: artwork::ArtworkCache::default(),
             sender,
             receiver,
         }
@@ -1007,7 +1124,7 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let path = std::env::temp_dir().join(format!("rgsx-test-{}-{id}", std::process::id()));
+            let path = PathBuf::from(format!(".rgsx-test-{}-{id}", std::process::id()));
             std::fs::create_dir(&path).unwrap();
             Self(path)
         }
@@ -1029,6 +1146,7 @@ mod tests {
             name: "example.zip".to_owned(),
             url: format!("http://{}/file", listener.local_addr().unwrap()),
             size: String::new(),
+            ..Default::default()
         };
         let response = format!("HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
         let body = body.to_vec();
@@ -1038,7 +1156,7 @@ mod tests {
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
             let mut request = [0; 4096];
-            socket.read(&mut request).unwrap();
+            assert!(socket.read(&mut request).unwrap() > 0);
             socket.write_all(response.as_bytes()).unwrap();
             socket.write_all(&body).unwrap();
         });
@@ -1091,7 +1209,7 @@ mod tests {
         assert!(app.downloads[0].status.contains("Settings"));
         app.output_dir = ".".to_owned();
         app.start_download(app.games[0].clone());
-        assert!(app.downloads[1].status.contains("HTTP(S)"));
+        assert!(app.downloads[1].status.contains("Invalid legacy torrent"));
         assert!(app.downloads[1].failed);
     }
 
@@ -1173,6 +1291,7 @@ mod tests {
             name: "existing.zip".to_owned(),
             url: "http://127.0.0.1:1/unused".to_owned(),
             size: String::new(),
+            ..Default::default()
         };
         let error = download_game(&reqwest::Client::new(), &game, &directory.0, false, |_| {})
             .await
@@ -1218,15 +1337,78 @@ mod tests {
                 name: "Example".to_owned(),
                 url: String::new(),
                 size: String::new(),
+                ..Default::default()
             },
             Game {
                 name: "Example 2".to_owned(),
                 url: String::new(),
                 size: String::new(),
+                ..Default::default()
             },
         ];
         assert_eq!(resolve_game(&games, "example").unwrap().name, "Example");
         assert!(resolve_game(&games, "exam").is_err());
         assert!(resolve_game(&games, " ").is_err());
+    }
+
+    #[test]
+    fn cli_accepts_all_hoster_providers_and_rejects_unknown_values() {
+        for provider in ["direct", "real-debrid", "all-debrid", "debrid-link"] {
+            assert!(Cli::try_parse_from([
+                "rgsx",
+                "download",
+                "--platform",
+                "nes",
+                "--game",
+                "Example",
+                "--provider",
+                provider,
+            ])
+            .is_ok());
+        }
+        assert!(parse_provider("unknown").is_err());
+    }
+
+    #[test]
+    fn invalid_downloads_fail_synchronously_even_with_a_provider() {
+        for value in [
+            "not a URL",
+            "ftp://example.com/file",
+            "magnet:invalid",
+            "magnet:?xt=urn:btih:not-a-valid-hash",
+        ] {
+            let mut app = test_app();
+            app.debrid.provider = debrid::Provider::RealDebrid;
+            let game = Game {
+                url: value.to_owned(),
+                ..Default::default()
+            };
+            app.start_download(game);
+            assert!(!app.downloading, "{value}");
+            assert!(app.downloads[0].failed, "{value}");
+            assert!(app.downloads[0].status.contains("failed"));
+        }
+        assert!(
+            validate_download("magnet:?xt=urn:btih:0123456789012345678901234567890123456789")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn catalog_accepts_artwork_aliases() {
+        for field in [
+            "artwork_url",
+            "boxart",
+            "boxart_url",
+            "image_url",
+            "cover_url",
+            "thumbnail",
+        ] {
+            let game: Game = serde_json::from_value(serde_json::json!({
+                "name": "Example", field: "https://example.com/art.png"
+            }))
+            .unwrap();
+            assert_eq!(game.artwork_url, "https://example.com/art.png", "{field}");
+        }
     }
 }

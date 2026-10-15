@@ -68,7 +68,7 @@ jobs:
             gh release create "$TAG" dist/rgsx.exe \
               --target "$COMMIT_SHA" \
               --title "Standalone Windows ${COMMIT_SHA:0:12}" \
-              --notes "Development build of the standalone Rust GUI/CLI for Windows x86-64 at commit ${COMMIT_SHA}. Download rgsx.exe and run it; no Python installation is required. Supports catalog browsing and direct HTTP(S) downloads, not the legacy app's premium/debrid or torrent features." \
+              --notes "Development build of the standalone Rust GUI/CLI for Windows x86-64 at commit ${COMMIT_SHA}. Download rgsx.exe and run it; no Python installation is required. Supports catalog browsing, box-art lookup, native torrent downloads, direct HTTP(S) downloads, and configurable debrid providers. See rust-app/README.md at this commit for supported providers and limitations." \
               --prerelease \
               --latest=false
           fi

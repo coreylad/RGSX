@@ -2,16 +2,16 @@
 
 **[Standalone app](#standalone-rust-app)** • **[Windows downloads](https://github.com/coreylad/RGSX/releases)** • **[Legacy installation](#-installation)** • **[Discord Support](https://discord.gg/XPK8YG8XYC)**
 
-This repository contains a standalone, cross-platform **Rust catalog browser and direct downloader**, alongside the original **Python RGSX application** for Batocera, Knulli, and RetroBat.
+This repository contains a standalone, cross-platform **Rust catalog browser and downloader**, alongside the original **Python RGSX application** for Batocera, Knulli, and RetroBat.
 
 ## Project scope
 
 | Application | Location | Current capabilities |
 |-------------|----------|----------------------|
-| Standalone Rust app | [`rust-app/`](rust-app/) | Native desktop GUI and optional CLI; browse platforms, list/search games, and download direct HTTP(S) links without Python, Batocera, or EmulationStation. |
+| Standalone Rust app | [`rust-app/`](rust-app/) | Native desktop GUI and optional CLI; browse/search games, look up box art, and download HTTP(S), torrent, and supported debrid links without Python, Batocera, or EmulationStation. |
 | Legacy Python app | [`ports/RGSX/`](ports/RGSX/), [`windows/`](windows/) | Controller-oriented interface, web interface, premium/debrid integrations, torrents, and emulator-system integration. |
 
-The Rust app is not yet a feature-complete replacement for the Python app. It does **not** currently provide its web server, controller-first interface, premium/debrid integrations, torrent backend, or Batocera-specific features. Catalog browsing needs an Internet connection; downloads require direct HTTP(S) URLs.
+The Rust app is not yet a feature-complete replacement for the Python app. It does **not** currently provide its web server, controller-first interface, or Batocera-specific features. Native torrent downloads run inside the standalone executable. Select a supported debrid provider and enter its API key in **Settings** to unlock hoster links. Catalog browsing, downloads, and box-art lookup need an Internet connection; artwork availability depends on the source.
 
 ## Standalone Rust app
 
