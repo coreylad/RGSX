@@ -46,7 +46,7 @@ enum Command {
         /// Destination directory.
         #[arg(long, default_value = ".")]
         output: PathBuf,
-        /// Replace a file with the same name if it already exists.
+        /// Replace an existing HTTP(S) download (not supported for native torrents).
         #[arg(long)]
         overwrite: bool,
         /// Hoster provider: direct, real-debrid, all-debrid, or debrid-link.
@@ -228,7 +228,7 @@ async fn download_release(
             client,
             &game.url,
             output,
-            &safe_filename(&game.name),
+            &torrent_download_name(game),
             on_progress,
         )
         .await;
@@ -240,6 +240,16 @@ async fn download_release(
     };
     download_game(client, &resolved_game, output, overwrite, on_progress).await?;
     Ok(output.join(safe_filename(&game.name)))
+}
+
+fn torrent_download_name(game: &Game) -> String {
+    if reqwest::Url::parse(game.url.trim()).is_ok_and(|url| url.scheme() == "rgsx+torrent") {
+        safe_filename(&game.name)
+    } else {
+        // Raw multi-file torrents need the relative catalog path to distinguish
+        // duplicate basenames; the backend validates it and writes its basename.
+        game.name.clone()
+    }
 }
 
 async fn fetch_pages<T: for<'de> Deserialize<'de> + Default>(
@@ -1392,6 +1402,18 @@ mod tests {
         assert_eq!(safe_filename(r"..\..\roms\game.zip"), "game.zip");
         assert_eq!(safe_filename(""), "download");
         assert_eq!(safe_filename("bad:name?.zip"), "bad_name_.zip");
+    }
+
+    #[test]
+    fn torrent_names_sanitize_legacy_destinations_but_preserve_raw_selection_paths() {
+        let mut game = Game {
+            name: "folder/game.zip".to_owned(),
+            url: "rgsx+torrent://download".to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(torrent_download_name(&game), "game.zip");
+        game.url = "https://example.com/collection.torrent".to_owned();
+        assert_eq!(torrent_download_name(&game), "folder/game.zip");
     }
 
     #[test]
