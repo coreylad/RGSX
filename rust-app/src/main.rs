@@ -91,6 +91,8 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| DEFAULT_CATALOG_URL.to_owned());
     let client = reqwest::Client::builder()
         .user_agent(concat!("RGSX/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(Duration::from_secs(15))
+        .read_timeout(Duration::from_secs(30))
         .build()
         .context("Could not initialize HTTP client")?;
 
@@ -282,10 +284,7 @@ async fn download_game(
     overwrite: bool,
     mut on_progress: impl FnMut(u64),
 ) -> Result<()> {
-    let url = reqwest::Url::parse(&game.url).context("Game has an invalid download URL")?;
-    if !matches!(url.scheme(), "http" | "https") {
-        bail!("Only direct HTTP(S) download links are supported");
-    }
+    let url = download_url(&game.url)?;
     tokio::fs::create_dir_all(output_dir)
         .await
         .with_context(|| format!("Could not create {}", output_dir.display()))?;
@@ -312,6 +311,18 @@ async fn download_game(
             .context("Could not start download")?
             .error_for_status()
             .context("Download server returned an error")?;
+        if response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                let media_type = value.split(';').next().unwrap_or_default().trim();
+                media_type.eq_ignore_ascii_case("text/html")
+                    || media_type.eq_ignore_ascii_case("application/xhtml+xml")
+            })
+        {
+            bail!("This link returned a web page, not a file. It may require a login or a provider integration that the standalone app does not support.");
+        }
         let mut file = tokio::fs::File::create(&temporary)
             .await
             .with_context(|| format!("Could not create {}", temporary.display()))?;
@@ -326,6 +337,7 @@ async fn download_game(
         file.flush()
             .await
             .context("Could not finish writing download")?;
+        on_progress(downloaded);
         drop(file);
         if overwrite && tokio::fs::try_exists(&destination).await? {
             let backup = output_dir.join(format!("{filename}.backup-{}", std::process::id()));
@@ -402,6 +414,14 @@ async fn download_game(
     Ok(())
 }
 
+fn download_url(value: &str) -> Result<reqwest::Url> {
+    let url = reqwest::Url::parse(value.trim()).context("Game has an invalid download URL")?;
+    if !matches!(url.scheme(), "http" | "https") {
+        bail!("Only direct HTTP(S) links are supported. Torrent and provider links require the legacy RGSX app.");
+    }
+    Ok(url)
+}
+
 fn safe_filename(name: &str) -> String {
     let basename = name.rsplit(['/', '\\']).next().unwrap_or_default();
     let sanitized: String = basename
@@ -429,6 +449,20 @@ enum GuiMessage {
     DownloadFinished(std::result::Result<PathBuf, String>),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tab {
+    Catalog,
+    Downloads,
+    Settings,
+}
+
+struct DownloadEntry {
+    name: String,
+    bytes: u64,
+    status: String,
+    failed: bool,
+}
+
 struct GuiApp {
     client: reqwest::Client,
     catalog_url: String,
@@ -440,6 +474,8 @@ struct GuiApp {
     output_dir: String,
     status: String,
     downloading: bool,
+    tab: Tab,
+    downloads: Vec<DownloadEntry>,
     sender: Sender<GuiMessage>,
     receiver: Receiver<GuiMessage>,
 }
@@ -458,6 +494,8 @@ impl GuiApp {
             output_dir: ".".to_owned(),
             status: "Loading catalog…".to_owned(),
             downloading: false,
+            tab: Tab::Catalog,
+            downloads: Vec::new(),
             sender,
             receiver,
         };
@@ -494,9 +532,26 @@ impl GuiApp {
     }
 
     fn start_download(&mut self, game: Game) {
+        if self.downloading {
+            return;
+        }
+        self.tab = Tab::Downloads;
+        self.downloads.push(DownloadEntry {
+            name: game.name.clone(),
+            bytes: 0,
+            status: "Connecting to download server…".to_owned(),
+            failed: false,
+        });
         let output_dir = PathBuf::from(self.output_dir.trim());
-        if output_dir.as_os_str().is_empty() {
-            self.status = "Choose a download folder first.".to_owned();
+        let validation = if output_dir.as_os_str().is_empty() {
+            Err(anyhow::anyhow!(
+                "Choose a download folder in Settings first."
+            ))
+        } else {
+            download_url(&game.url).map(|_| ())
+        };
+        if let Err(error) = validation {
+            self.finish_download(Err(format!("{error:#}")));
             return;
         }
         self.downloading = true;
@@ -507,7 +562,9 @@ impl GuiApp {
             let destination = output_dir.join(safe_filename(&game.name));
             let progress_sender = sender.clone();
             let mut last_reported = 0;
-            let result = download_game(&client, &game, &output_dir, false, move |bytes| {
+            let mut received = 0;
+            let result = download_game(&client, &game, &output_dir, false, |bytes| {
+                received = bytes;
                 if bytes >= last_reported + 512 * 1024 {
                     last_reported = bytes;
                     let _ = progress_sender.send(GuiMessage::DownloadProgress(bytes));
@@ -516,6 +573,7 @@ impl GuiApp {
             .await
             .map(|()| destination)
             .map_err(|error| format!("{error:#}"));
+            let _ = sender.send(GuiMessage::DownloadProgress(received));
             let _ = sender.send(GuiMessage::DownloadFinished(result));
         });
     }
@@ -547,18 +605,280 @@ impl GuiApp {
                     self.status = format!("{} games loaded.", self.games.len());
                 }
                 GuiMessage::DownloadProgress(bytes) => {
-                    self.status = format!("Downloading… {bytes} bytes received");
+                    if let Some(entry) = self.downloads.last_mut() {
+                        entry.bytes = bytes;
+                        entry.status = "Receiving file…".to_owned();
+                    }
                 }
-                GuiMessage::DownloadFinished(Ok(path)) => {
-                    self.downloading = false;
-                    self.status = format!("Download saved to {}", path.display());
-                }
-                GuiMessage::DownloadFinished(Err(error)) => {
-                    self.downloading = false;
-                    self.status = format!("Download failed: {error}");
+                GuiMessage::DownloadFinished(result) => {
+                    self.finish_download(result);
                 }
             }
         }
+    }
+
+    fn finish_download(&mut self, result: std::result::Result<PathBuf, String>) {
+        self.downloading = false;
+        let failed = result.is_err();
+        let status = match result {
+            Ok(path) => format!("Saved to {}", path.display()),
+            Err(error) => format!("Download failed: {error}"),
+        };
+        if let Some(entry) = self.downloads.last_mut() {
+            entry.status = status;
+            entry.failed = failed;
+        }
+    }
+
+    fn show(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::top("navigation")
+            .min_size(112.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgb(22, 30, 48))
+                    .inner_margin(16.0),
+            )
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading(
+                        egui::RichText::new("RGSX")
+                            .size(28.0)
+                            .color(egui::Color32::from_rgb(102, 218, 211)),
+                    );
+                    ui.label(egui::RichText::new("RETRO GAME SETS XTRA").small().weak());
+                });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.tab, Tab::Catalog, "Catalog");
+                    let label = if self.downloading {
+                        "Downloads • active"
+                    } else {
+                        "Downloads"
+                    };
+                    ui.selectable_value(&mut self.tab, Tab::Downloads, label);
+                    ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
+                });
+            });
+
+        egui::Panel::bottom("status-bar").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                if self.downloading {
+                    ui.spinner();
+                    ui.label("Download in progress • see Downloads");
+                } else {
+                    ui.label(
+                        egui::RichText::new("Ready").color(egui::Color32::from_rgb(102, 218, 211)),
+                    );
+                }
+                ui.separator();
+                ui.add(egui::Label::new(&self.status).truncate())
+                    .on_hover_text(&self.status);
+            });
+        });
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::central_panel(ui.style()).inner_margin(18.0))
+            .show(ui, |ui| match self.tab {
+                Tab::Catalog => self.show_catalog(ui),
+                Tab::Downloads => self.show_downloads(ui),
+                Tab::Settings => self.show_settings(ui),
+            });
+    }
+
+    fn show_catalog(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Explore your next classic");
+        ui.label(
+            egui::RichText::new("Choose a system, find a game, and start downloading.").weak(),
+        );
+        ui.add_space(12.0);
+        let previous_platform = self.selected_platform_id;
+        ui.horizontal(|ui| {
+            let selected_name = self
+                .platforms
+                .iter()
+                .find(|platform| Some(platform.id) == self.selected_platform_id)
+                .map(|platform| platform.platform_name.as_str())
+                .unwrap_or("Select a platform");
+            egui::ComboBox::from_id_salt("platform-picker")
+                .width(240.0)
+                .selected_text(selected_name)
+                .show_ui(ui, |ui| {
+                    for platform in &self.platforms {
+                        ui.selectable_value(
+                            &mut self.selected_platform_id,
+                            Some(platform.id),
+                            &platform.platform_name,
+                        );
+                    }
+                });
+            if ui.button("Refresh catalog").clicked() {
+                self.load_platforms();
+            }
+        });
+        if previous_platform != self.selected_platform_id {
+            if let Some(id) = self.selected_platform_id {
+                self.load_games(id);
+            }
+        }
+        ui.add_space(8.0);
+        ui.add(
+            egui::TextEdit::singleline(&mut self.search)
+                .hint_text("Search games…")
+                .desired_width(f32::INFINITY),
+        );
+        let query = self.search.trim().to_lowercase();
+        let visible_games: Vec<_> = self
+            .games
+            .iter()
+            .filter(|game| query.is_empty() || game.name.to_lowercase().contains(&query))
+            .collect();
+        ui.label(
+            egui::RichText::new(format!("{} games", visible_games.len()))
+                .small()
+                .weak(),
+        );
+        ui.separator();
+        let mut requested_download = None;
+        egui::ScrollArea::vertical()
+            .id_salt("catalog-list")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if !self.games_loaded && self.selected_platform_id.is_some() {
+                    ui.label("Loading games…");
+                } else if visible_games.is_empty() {
+                    ui.label(if self.games_loaded && self.games.is_empty() {
+                        "No games in this platform."
+                    } else {
+                        "No games match this search."
+                    });
+                }
+                for (index, game) in visible_games.into_iter().enumerate() {
+                    ui.push_id(index, |ui| {
+                        egui::Frame::group(ui.style())
+                            .inner_margin(10.0)
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        let available =
+                                            !self.downloading && !game.url.trim().is_empty();
+                                        let response = ui.add_enabled(
+                                            available,
+                                            egui::Button::new("Download")
+                                                .min_size(egui::vec2(94.0, 32.0)),
+                                        );
+                                        let response = if self.downloading {
+                                            response.on_disabled_hover_text(
+                                                "Wait for the current download to finish.",
+                                            )
+                                        } else if game.url.trim().is_empty() {
+                                            response.on_disabled_hover_text(
+                                                "This catalog entry has no download link.",
+                                            )
+                                        } else {
+                                            response
+                                        };
+                                        if response.clicked() {
+                                            requested_download = Some(game.clone());
+                                        }
+                                        ui.allocate_ui_with_layout(
+                                            egui::vec2(ui.available_width(), 40.0),
+                                            egui::Layout::top_down(egui::Align::Min),
+                                            |ui| {
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        egui::RichText::new(&game.name).strong(),
+                                                    )
+                                                    .truncate(),
+                                                )
+                                                .on_hover_text(&game.name);
+                                                if !game.size.is_empty() {
+                                                    ui.label(
+                                                        egui::RichText::new(&game.size)
+                                                            .small()
+                                                            .weak(),
+                                                    );
+                                                }
+                                            },
+                                        );
+                                    },
+                                );
+                            });
+                        ui.add_space(4.0);
+                    });
+                }
+            });
+        if let Some(game) = requested_download {
+            self.start_download(game);
+        }
+    }
+
+    fn show_downloads(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Your downloads");
+        ui.label(
+            egui::RichText::new("Progress and results for this session. One download at a time.")
+                .weak(),
+        );
+        ui.add_space(12.0);
+        egui::ScrollArea::vertical()
+            .id_salt("download-list")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if self.downloads.is_empty() {
+                    ui.label("Nothing here yet. Start a download from the Catalog tab.");
+                }
+                for (index, entry) in self.downloads.iter().enumerate().rev() {
+                    egui::Frame::group(ui.style())
+                        .inner_margin(12.0)
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(&entry.name).strong()).wrap(),
+                            );
+                            if self.downloading && index + 1 == self.downloads.len() {
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    ui.label(format!(
+                                        "{:.2} MiB received",
+                                        entry.bytes as f64 / 1_048_576.0
+                                    ));
+                                });
+                            } else {
+                                ui.label(format!(
+                                    "{:.2} MiB received",
+                                    entry.bytes as f64 / 1_048_576.0
+                                ));
+                            }
+                            let color = if entry.failed {
+                                egui::Color32::from_rgb(255, 150, 145)
+                            } else {
+                                egui::Color32::from_rgb(102, 218, 211)
+                            };
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(&entry.status).color(color))
+                                    .wrap(),
+                            );
+                        });
+                    ui.add_space(8.0);
+                }
+            });
+    }
+
+    fn show_settings(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical().id_salt("settings").show(ui, |ui| {
+                ui.heading("Make yourself at home");
+                ui.add_space(12.0);
+                ui.label(egui::RichText::new("Download folder").strong());
+                ui.add(egui::TextEdit::singleline(&mut self.output_dir).desired_width(f32::INFINITY));
+                ui.label("Use a full folder path, or “.” for the current working directory. Changes apply to the next download.");
+                ui.add_space(16.0);
+                ui.label(egui::RichText::new("Safe downloads").strong());
+                ui.label("Existing files are never replaced. Choose another folder or move an existing file before retrying.");
+                ui.add_space(16.0);
+                ui.label(egui::RichText::new("Supported links").strong());
+                ui.label("Direct HTTP(S) files only. Links requiring a provider login, debrid service, or torrent backend need the legacy RGSX app.");
+            });
     }
 }
 
@@ -568,95 +888,7 @@ impl eframe::App for GuiApp {
         let context = ui.ctx();
         context.request_repaint_after(Duration::from_millis(100));
 
-        let mut requested_download = None;
-        let previous_platform = self.selected_platform_id;
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.heading("RGSX — Retro Game Sets Xtra");
-            ui.label("Browse the catalog and download directly to your chosen folder.");
-            ui.separator();
-
-            ui.horizontal(|ui| {
-                ui.label("Platform");
-                let selected_name = self
-                    .platforms
-                    .iter()
-                    .find(|platform| Some(platform.id) == self.selected_platform_id)
-                    .map(|platform| platform.platform_name.as_str())
-                    .unwrap_or("Select a platform");
-                egui::ComboBox::from_id_salt("platform-picker")
-                    .selected_text(selected_name)
-                    .show_ui(ui, |ui| {
-                        for platform in &self.platforms {
-                            ui.selectable_value(
-                                &mut self.selected_platform_id,
-                                Some(platform.id),
-                                &platform.platform_name,
-                            );
-                        }
-                    });
-                if ui.button("Refresh").clicked() {
-                    self.load_platforms();
-                }
-            });
-
-            if previous_platform != self.selected_platform_id {
-                if let Some(id) = self.selected_platform_id {
-                    self.load_games(id);
-                }
-            }
-
-            ui.horizontal(|ui| {
-                ui.label("Search");
-                ui.text_edit_singleline(&mut self.search);
-            });
-            ui.horizontal(|ui| {
-                ui.label("Download folder");
-                ui.text_edit_singleline(&mut self.output_dir);
-            });
-            ui.separator();
-
-            let query = self.search.trim().to_lowercase();
-            let visible_games: Vec<_> = self
-                .games
-                .iter()
-                .filter(|game| query.is_empty() || game.name.to_lowercase().contains(&query))
-                .cloned()
-                .collect();
-            let no_visible_games = visible_games.is_empty();
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    for game in visible_games {
-                        ui.horizontal(|ui| {
-                            ui.label(&game.name);
-                            if !game.size.is_empty() {
-                                ui.label(&game.size);
-                            }
-                            let can_download = !self.downloading && !game.url.is_empty();
-                            if ui
-                                .add_enabled(can_download, egui::Button::new("Download"))
-                                .clicked()
-                            {
-                                requested_download = Some(game.clone());
-                            }
-                        });
-                        ui.separator();
-                    }
-                });
-
-            ui.label(&self.status);
-            if !self.games_loaded && self.selected_platform_id.is_some() {
-                ui.label("Loading games…");
-            } else if self.games.is_empty() && self.games_loaded {
-                ui.label("No games in this platform.");
-            } else if no_visible_games {
-                ui.label("No games match this search.");
-            }
-        });
-
-        if let Some(game) = requested_download {
-            self.start_download(game);
-        }
+        self.show(ui);
     }
 }
 
@@ -680,14 +912,277 @@ fn launch_gui(client: reqwest::Client, catalog_url: String) -> Result<()> {
     eframe::run_native(
         "RGSX",
         options,
-        Box::new(move |_creation_context| Ok(Box::new(GuiApp::new(client, catalog_url)))),
+        Box::new(move |creation_context| {
+            let context = &creation_context.egui_ctx;
+            let mut visuals = egui::Visuals::dark();
+            visuals.panel_fill = egui::Color32::from_rgb(16, 22, 35);
+            visuals.selection.bg_fill = egui::Color32::from_rgb(30, 99, 110);
+            context.set_visuals(visuals);
+            context.global_style_mut(|style| {
+                style.spacing.item_spacing = egui::vec2(10.0, 8.0);
+                style.spacing.button_padding = egui::vec2(14.0, 8.0);
+            });
+            Ok(Box::new(GuiApp::new(client, catalog_url)))
+        }),
     )
     .map_err(|error| anyhow::anyhow!("Could not start RGSX GUI: {error}"))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_game, resolve_platform, safe_filename, Game, Platform};
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    fn test_app() -> GuiApp {
+        let (sender, receiver) = mpsc::channel();
+        GuiApp {
+            client: reqwest::Client::new(),
+            catalog_url: String::new(),
+            platforms: vec![Platform {
+                id: 1,
+                platform_name: "Test system".to_owned(),
+                folder: "test".to_owned(),
+            }],
+            selected_platform_id: Some(1),
+            games: vec![Game {
+                name: "A very long game title ".repeat(25),
+                url: "rgsx+torrent://unsupported".to_owned(),
+                size: "24 MiB".to_owned(),
+            }],
+            games_loaded: true,
+            search: String::new(),
+            output_dir: ".".to_owned(),
+            status: "Catalog ready".to_owned(),
+            downloading: false,
+            tab: Tab::Catalog,
+            downloads: Vec::new(),
+            sender,
+            receiver,
+        }
+    }
+
+    fn render(
+        app: &mut GuiApp,
+        context: &egui::Context,
+        size: egui::Vec2,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let mut output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                events,
+                ..Default::default()
+            },
+            |ui| app.show(ui),
+        );
+        output.textures_delta.clear();
+        output
+    }
+
+    fn text_rect(output: &egui::FullOutput, text: &str) -> egui::Rect {
+        fn find(shape: &egui::epaint::Shape, text: &str) -> Option<egui::Rect> {
+            match shape {
+                egui::epaint::Shape::Text(shape) if shape.galley.text() == text => {
+                    Some(shape.galley.rect.translate(shape.pos.to_vec2()))
+                }
+                egui::epaint::Shape::Vec(shapes) => {
+                    shapes.iter().find_map(|shape| find(shape, text))
+                }
+                _ => None,
+            }
+        }
+        output
+            .shapes
+            .iter()
+            .find_map(|shape| find(&shape.shape, text))
+            .unwrap_or_else(|| panic!("Missing visible text: {text}"))
+    }
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let id = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!("rgsx-test-{}-{id}", std::process::id()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn serve_download(
+        content_type: &str,
+        body: &[u8],
+        status: &str,
+    ) -> (Game, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let game = Game {
+            name: "example.zip".to_owned(),
+            url: format!("http://{}/file", listener.local_addr().unwrap()),
+            size: String::new(),
+        };
+        let response = format!("HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+        let body = body.to_vec();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = [0; 4096];
+            socket.read(&mut request).unwrap();
+            socket.write_all(response.as_bytes()).unwrap();
+            socket.write_all(&body).unwrap();
+        });
+        (game, server)
+    }
+
+    #[test]
+    fn download_button_is_visible_and_clickable_with_long_titles_at_minimum_size() {
+        let mut app = test_app();
+        let context = egui::Context::default();
+        let size = egui::vec2(600.0, 400.0);
+        let output = render(&mut app, &context, size, vec![]);
+        let button = text_rect(&output, "Download");
+        let footer = text_rect(&output, "Ready");
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+        assert!(screen.contains_rect(button));
+        assert!(screen.contains_rect(footer));
+        assert!(button.bottom() < footer.top());
+        let position = button.center();
+        for pressed in [true, false] {
+            render(
+                &mut app,
+                &context,
+                size,
+                vec![
+                    egui::Event::PointerMoved(position),
+                    egui::Event::PointerButton {
+                        pos: position,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        assert_eq!(app.tab, Tab::Downloads);
+        assert_eq!(app.downloads.len(), 1);
+        assert!(app.downloads[0].failed);
+        let output = render(&mut app, &context, size, vec![]);
+        assert!(screen.contains_rect(text_rect(&output, "Your downloads")));
+        assert!(screen.contains_rect(text_rect(&output, "Ready")));
+    }
+
+    #[test]
+    fn invalid_folder_and_unsupported_links_have_visible_errors() {
+        let mut app = test_app();
+        app.output_dir = " ".to_owned();
+        app.start_download(app.games[0].clone());
+        assert!(!app.downloading);
+        assert!(app.downloads[0].status.contains("Settings"));
+        app.output_dir = ".".to_owned();
+        app.start_download(app.games[0].clone());
+        assert!(app.downloads[1].status.contains("HTTP(S)"));
+        assert!(app.downloads[1].failed);
+    }
+
+    #[test]
+    fn catalog_messages_do_not_replace_download_results() {
+        let mut app = test_app();
+        app.start_download(app.games[0].clone());
+        let error = app.downloads[0].status.clone();
+        app.sender.send(GuiMessage::Games(Ok(vec![]))).unwrap();
+        app.receive_messages();
+        assert_eq!(app.downloads[0].status, error);
+    }
+
+    #[test]
+    fn tabs_keep_status_visible_when_resized() {
+        let mut app = test_app();
+        for size in [egui::vec2(600.0, 400.0), egui::vec2(900.0, 700.0)] {
+            for tab in [Tab::Catalog, Tab::Downloads, Tab::Settings] {
+                app.tab = tab;
+                let output = render(&mut app, &egui::Context::default(), size, vec![]);
+                let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+                assert!(screen.contains_rect(text_rect(&output, "Ready")));
+                assert!(screen.contains_rect(text_rect(&output, "Settings")));
+            }
+        }
+    }
+
+    #[test]
+    fn gui_download_reports_small_file_completion() {
+        let directory = TestDirectory::new();
+        let (game, server) = serve_download("application/zip", b"test file", "200 OK");
+        let mut app = test_app();
+        app.output_dir = directory.0.to_string_lossy().into_owned();
+        app.start_download(game);
+        assert_eq!(app.tab, Tab::Downloads);
+        assert!(app.downloading);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while app.downloading && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+            app.receive_messages();
+        }
+        assert!(!app.downloading);
+        assert!(!app.downloads[0].failed, "{}", app.downloads[0].status);
+        assert!(app.downloads[0].status.contains("Saved to"));
+        assert_eq!(app.downloads[0].bytes, 9);
+        assert_eq!(
+            std::fs::read(directory.0.join("example.zip")).unwrap(),
+            b"test file"
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn download_rejects_web_pages_and_server_errors_without_saving() {
+        for (content_type, status, expected) in [
+            ("text/html; charset=utf-8", "200 OK", "web page"),
+            (
+                "application/octet-stream",
+                "403 Forbidden",
+                "server returned an error",
+            ),
+        ] {
+            let directory = TestDirectory::new();
+            let (game, server) = serve_download(content_type, b"not a game", status);
+            let error = download_game(&reqwest::Client::new(), &game, &directory.0, false, |_| {})
+                .await
+                .unwrap_err();
+            assert!(format!("{error:#}").contains(expected));
+            assert_eq!(std::fs::read_dir(&directory.0).unwrap().count(), 0);
+            server.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn download_preserves_existing_files() {
+        let directory = TestDirectory::new();
+        std::fs::write(directory.0.join("existing.zip"), b"original").unwrap();
+        let game = Game {
+            name: "existing.zip".to_owned(),
+            url: "http://127.0.0.1:1/unused".to_owned(),
+            size: String::new(),
+        };
+        let error = download_game(&reqwest::Client::new(), &game, &directory.0, false, |_| {})
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("already exists"));
+        assert_eq!(
+            std::fs::read(directory.0.join("existing.zip")).unwrap(),
+            b"original"
+        );
+    }
 
     #[test]
     fn filename_cannot_escape_output_directory() {

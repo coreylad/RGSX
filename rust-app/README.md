@@ -28,9 +28,20 @@ Running it without arguments opens the GUI. No Python runtime or Batocera
 packages are needed. On Linux, install the platform's usual X11 or Wayland
 development/runtime libraries if they are not already present.
 
-The GUI lets you choose a platform, filter games by title, set a download
-folder, and start direct downloads. Download progress and errors appear in the
-window.
+The GUI has three tabs:
+
+- **Catalog**: choose a platform, search titles, and start a download.
+- **Downloads**: see the active transfer's received bytes and this session's
+  completed or failed downloads. Starting a download opens this tab immediately.
+- **Settings**: set the download folder and review supported link types.
+
+The status bar stays visible when resizing the window. Long game titles are
+shortened (hover to read the full title) so Download buttons stay on screen.
+Downloads run one at a time and never replace existing files. Errors, including
+unavailable links or unwritable folders, remain in the Downloads tab.
+Web pages returned instead of files are rejected with an explanation; provider
+login/debrid and torrent links still require the legacy app. Connections time
+out after 15 seconds, and stalled reads after 30 seconds.
 
 ## Optional CLI
 
