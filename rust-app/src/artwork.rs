@@ -63,7 +63,17 @@ impl ArtworkCache {
                 self.missing.insert(key);
             }
         }
-        let key = format!("{}\0{}\0{}", platform.id, game.name, game.artwork_url);
+        let catalog_urls = catalog_artwork(game);
+        let key = format!(
+            "{}\0{}\0{}",
+            platform.id,
+            game.name,
+            catalog_urls
+                .iter()
+                .map(reqwest::Url::as_str)
+                .collect::<Vec<_>>()
+                .join("\0"),
+        );
         if let Some(texture) = self.textures.get(&key) {
             self.recent.retain(|entry| entry != &key);
             self.recent.push_back(key);
@@ -191,10 +201,35 @@ fn libretro_system(platform: &super::Platform) -> Option<&'static str> {
             _ => None,
         }
     }
-    identify(&platform.folder).or_else(|| {
-        identify(&platform.platform_name)
-            .or_else(|| identify(&platform.platform_name.replace(" - ", " ")))
+    identify(&platform_identity(&platform.folder)).or_else(|| {
+        let name = platform_identity(&platform.platform_name);
+        identify(&name).or_else(|| identify(&name.replace(" - ", " ")))
     })
+}
+
+fn platform_identity(value: &str) -> String {
+    let mut name = value.trim().to_owned();
+    loop {
+        let lowercase = name.to_ascii_lowercase();
+        let Some(suffix) = [
+            "(torrents)",
+            "[torrents]",
+            "torrents",
+            "(torrent)",
+            "[torrent]",
+            "torrent",
+            "(1fichier)",
+            "[1fichier]",
+            "1fichier",
+        ]
+        .into_iter()
+        .find(|suffix| lowercase.ends_with(suffix)) else {
+            break;
+        };
+        name.truncate(name.len() - suffix.len());
+        name = name.trim_end_matches([' ', '-', '_', '.', ':']).to_owned();
+    }
+    name
 }
 
 fn release_title(name: &str) -> String {
@@ -270,13 +305,57 @@ fn release_metadata(value: &str) -> bool {
         })
 }
 
-fn candidates(platform: &super::Platform, game: &super::Game) -> Vec<reqwest::Url> {
-    let mut urls = Vec::new();
-    if let Ok(url) = reqwest::Url::parse(&game.artwork_url) {
-        if matches!(url.scheme(), "http" | "https") {
-            urls.push(url);
+fn catalog_artwork(game: &super::Game) -> Vec<reqwest::Url> {
+    fn add(urls: &mut Vec<reqwest::Url>, value: &str) {
+        if let Ok(url) = reqwest::Url::parse(value) {
+            if matches!(url.scheme(), "http" | "https") && !urls.contains(&url) {
+                urls.push(url);
+            }
         }
     }
+    fn fields(urls: &mut Vec<reqwest::Url>, metadata: &serde_json::Value) {
+        for key in [
+            "artwork_url",
+            "boxart_url",
+            "boxart",
+            "box_art",
+            "cover_url",
+            "cover",
+            "image_url",
+            "image",
+            "thumbnail_url",
+            "thumbnail",
+            "front",
+        ] {
+            let value = &metadata[key];
+            if let Some(url) = value
+                .as_str()
+                .or_else(|| value.get("url").and_then(|url| url.as_str()))
+            {
+                add(urls, url);
+            }
+        }
+    }
+    let mut urls = Vec::new();
+    add(&mut urls, &game.artwork_url);
+    fields(&mut urls, &game.metadata_json);
+    for container in ["artwork", "images"] {
+        fields(&mut urls, &game.metadata_json[container]);
+        if container == "artwork" {
+            if let Some(url) = game.metadata_json[container].as_str().or_else(|| {
+                game.metadata_json[container]
+                    .get("url")
+                    .and_then(|url| url.as_str())
+            }) {
+                add(&mut urls, url);
+            }
+        }
+    }
+    urls
+}
+
+fn candidates(platform: &super::Platform, game: &super::Game) -> Vec<reqwest::Url> {
+    let mut urls = catalog_artwork(game);
     let Some(system) = libretro_system(platform) else {
         return urls;
     };
@@ -397,6 +476,35 @@ mod tests {
     }
 
     #[test]
+    fn source_suffixes_do_not_change_the_matched_platform() {
+        for folder in [
+            "gbc_torrent",
+            "gbc-1fichier",
+            "gbc (Torrent)",
+            "gbc [1Fichier]",
+        ] {
+            assert_eq!(
+                libretro_system(&platform(folder)),
+                Some("Nintendo - Game Boy Color")
+            );
+        }
+        for name in [
+            "Super Nintendo - Torrent",
+            "Super Nintendo (1Fichier)",
+            "Super Nintendo [Torrents]",
+        ] {
+            assert_eq!(
+                libretro_system(&super::super::Platform {
+                    platform_name: name.to_owned(),
+                    ..Default::default()
+                }),
+                Some("Nintendo - Super Nintendo Entertainment System")
+            );
+        }
+        assert_eq!(libretro_system(&platform("unrecognized_torrent")), None);
+    }
+
+    #[test]
     fn normalizes_release_metadata_without_removing_internal_title() {
         assert_eq!(normalized_title("Example (USA) (Rev 1) [!].zip"), "Example");
         assert_eq!(
@@ -424,6 +532,34 @@ mod tests {
             .starts_with("/libretro-thumbnails/Nintendo_-_Game_Boy_Color/master/")));
         assert_eq!(candidates(&platform("unknown"), &game).len(), 1);
         assert!(decode_image(b"not an image").is_none());
+    }
+
+    #[test]
+    fn reads_per_release_metadata_without_using_platform_logos() {
+        let mut game: super::super::Game = serde_json::from_value(serde_json::json!({
+            "name": "Example",
+            "metadata_json": serde_json::json!({
+                "cover_url": "https://example.com/cover.png",
+                "images": {"front": "https://example.com/front.jpg"},
+                "platform_assets": {"image_url": "https://example.com/logo.png"},
+                "url": "https://example.com/download.zip"
+            }).to_string()
+        }))
+        .unwrap();
+        let urls = candidates(&platform("unknown"), &game);
+        assert_eq!(urls.len(), 2);
+        assert_eq!(urls[0].as_str(), "https://example.com/cover.png");
+        assert_eq!(urls[1].as_str(), "https://example.com/front.jpg");
+        game.artwork_url = "https://example.com/preferred.png".to_owned();
+        assert_eq!(
+            candidates(&platform("unknown"), &game)[0].as_str(),
+            game.artwork_url
+        );
+        let malformed: super::super::Game = serde_json::from_value(serde_json::json!({
+            "name": "Example", "metadata_json": "not JSON"
+        }))
+        .unwrap();
+        assert!(catalog_artwork(&malformed).is_empty());
     }
 
     #[tokio::test]

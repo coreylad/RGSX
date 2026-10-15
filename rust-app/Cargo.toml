@@ -2,7 +2,7 @@
 name = "rgsx"
 version = "0.1.0"
 edition = "2021"
-description = "Standalone cross-platform RGSX catalog browser and direct downloader"
+description = "Standalone cross-platform RGSX catalog browser and torrent and debrid downloader"
 license = "GPL-3.0-or-later"
 
 [[bin]]

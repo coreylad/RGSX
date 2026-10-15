@@ -48,7 +48,9 @@ Torrent transfers run inside the executable; no Python, qBittorrent, or separate
 torrent client is needed. Catalog `rgsx+torrent://` links select the release inside
 a multi-file torrent rather than downloading the entire collection. Magnet and
 HTTP(S) `.torrent` links are also supported. Transfers depend on available peers;
-allow the app through your firewall if necessary. Download only content you are
+allow the app through your firewall if necessary. Metadata lookup times out after
+three minutes; a transfer with no verified progress for five minutes fails so
+another download can be started. Download only content you are
 authorized to obtain.
 
 For supported hoster links, choose **Real-Debrid**, **AllDebrid**, or

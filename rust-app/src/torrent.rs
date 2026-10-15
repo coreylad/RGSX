@@ -7,6 +7,7 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
 const MAX_MANIFEST_BYTES: usize = 32 * 1024 * 1024;
+const STALLED_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 static NEXT_DOWNLOAD: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
@@ -139,6 +140,12 @@ struct TorrentFile {
     size: u64,
 }
 
+fn metadata_path<BufType: AsRef<[u8]>>(
+    filename: &librqbit::FileIteratorName<'_, BufType>,
+) -> String {
+    filename.iter_components().collect::<Vec<_>>().join("/")
+}
+
 fn select_file(
     selection: &Selection,
     files: &[TorrentFile],
@@ -236,7 +243,34 @@ pub async fn download(
     value: &str,
     output: &Path,
     name: &str,
+    on_progress: impl FnMut(u64),
+) -> Result<PathBuf> {
+    download_with_options(
+        client,
+        value,
+        output,
+        name,
+        on_progress,
+        SessionOptions {
+            dht: Some(librqbit::DhtSessionConfig {
+                persistence: None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        STALLED_DOWNLOAD_TIMEOUT,
+    )
+    .await
+}
+
+async fn download_with_options(
+    client: &reqwest::Client,
+    value: &str,
+    output: &Path,
+    name: &str,
     mut on_progress: impl FnMut(u64),
+    session_options: SessionOptions,
+    stalled_timeout: Duration,
 ) -> Result<PathBuf> {
     let selection = parse(value)?;
     safe_relative(name).context("Unsafe destination filename")?;
@@ -255,18 +289,9 @@ pub async fn download(
     }
     let staging = Staging::create(&output)?;
     let session = SessionGuard(
-        Session::new_with_opts(
-            staging.0.clone(),
-            SessionOptions {
-                dht: Some(librqbit::DhtSessionConfig {
-                    persistence: None,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-        )
-        .await
-        .context("Could not initialize native torrent session")?,
+        Session::new_with_opts(staging.0.clone(), session_options)
+            .await
+            .context("Could not initialize native torrent session")?,
     );
     let result: Result<(PathBuf, u64)> = async {
         let source = if Url::parse(&selection.source)?.scheme() == "magnet" {
@@ -322,7 +347,7 @@ pub async fn download(
                     "Torrent symlinks are not supported"
                 );
                 Ok(TorrentFile {
-                    path: file.filename.to_string(),
+                    path: metadata_path(&file.filename),
                     size: file.len,
                 })
             })
@@ -345,6 +370,7 @@ pub async fn download(
             .into_handle()
             .context("Could not start selected torrent file")?;
         let mut last_progress = 0;
+        let mut last_activity = tokio::time::Instant::now();
         on_progress(0);
         loop {
             let stats = handle.stats();
@@ -352,11 +378,19 @@ pub async fn download(
                 bail!("Torrent download failed: {error}");
             }
             let progress = stats.file_progress.get(index).copied().unwrap_or(0);
+            if progress > last_progress {
+                last_activity = tokio::time::Instant::now();
+            }
             last_progress = last_progress.max(progress.min(selected.size));
             on_progress(last_progress);
             if stats.finished {
                 break;
             }
+            ensure!(
+                last_activity.elapsed() < stalled_timeout,
+                "Torrent stalled: no verified download progress for {} seconds; no reachable peers may be available",
+                stalled_timeout.as_secs()
+            );
             tokio::time::sleep(Duration::from_millis(400)).await;
         }
         let path = staging.0.join(&selected.path);
@@ -370,13 +404,15 @@ pub async fn download(
     .await;
     session.0.stop().await;
     let (source, size) = result?;
+    // Declare cleanup before the handle so Windows closes it before removing a failed copy.
+    let mut incomplete = IncompleteFile(None);
     let mut target = tokio::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&destination)
         .await
         .context("Could not reserve torrent destination (will not overwrite)")?;
-    let mut incomplete = IncompleteFile(Some(destination.clone()));
+    incomplete.0 = Some(destination.clone());
     let mut source = tokio::fs::File::open(source).await?;
     let copied = tokio::io::copy(&mut source, &mut target).await?;
     ensure!(copied == size, "Incomplete torrent file copy");
@@ -390,6 +426,75 @@ pub async fn download(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct LocalTracker {
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl LocalTracker {
+        fn start(
+            listener: std::net::TcpListener,
+            manifest: Vec<u8>,
+            peer: std::net::SocketAddr,
+        ) -> Self {
+            use std::io::{Read, Write};
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let worker_stop = stop.clone();
+            listener.set_nonblocking(true).unwrap();
+            let worker = std::thread::spawn(move || {
+                while !worker_stop.load(Ordering::Relaxed) {
+                    let (mut stream, _) = match listener.accept() {
+                        Ok(connection) => connection,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                            continue;
+                        }
+                        Err(error) => panic!("Local tracker failed: {error}"),
+                    };
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(1)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(1)))
+                        .unwrap();
+                    let mut request = [0; 8192];
+                    let length = stream.read(&mut request).unwrap_or(0);
+                    let body = if request[..length].starts_with(b"GET /manifest.torrent ") {
+                        manifest.clone()
+                    } else {
+                        let std::net::IpAddr::V4(address) = peer.ip() else {
+                            panic!("Expected loopback IPv4 peer");
+                        };
+                        let mut body = b"d8:intervali1e5:peers6:".to_vec();
+                        body.extend_from_slice(&address.octets());
+                        body.extend_from_slice(&peer.port().to_be_bytes());
+                        body.push(b'e');
+                        body
+                    };
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes());
+                    let _ = stream.write_all(&body);
+                }
+            });
+            Self {
+                stop,
+                worker: Some(worker),
+            }
+        }
+    }
+
+    impl Drop for LocalTracker {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(worker) = self.worker.take() {
+                worker.join().unwrap();
+            }
+        }
+    }
 
     fn legacy(path: &str, index: &str) -> String {
         let mut url = Url::parse("rgsx+torrent://download").unwrap();
@@ -423,6 +528,29 @@ mod tests {
         );
         assert_eq!(
             select_file(&selection, &files(), Some("Collection"), "ignored").unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn nested_metadata_paths_use_catalog_slashes() {
+        let metadata = librqbit::torrent_from_bytes(
+            b"d4:infod5:filesld6:lengthi10e4:pathl6:nested6:folder8:game.zipeee4:name10:Collection12:piece lengthi16384e6:pieces20:00000000000000000000ee",
+        )
+        .unwrap();
+        let info = metadata.info.data.validate().unwrap();
+        let files = info
+            .iter_file_details()
+            .map(|file| TorrentFile {
+                path: metadata_path(&file.filename),
+                size: file.len,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(files[0].path, "nested/folder/game.zip");
+        safe_relative(&files[0].path).unwrap();
+        let selection = parse(&legacy("Collection/nested/folder/game.zip", "1")).unwrap();
+        assert_eq!(
+            select_file(&selection, &files, Some("Collection"), "ignored").unwrap(),
             0
         );
     }
@@ -512,5 +640,149 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("already exists"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_seed_downloads_only_selected_file_and_stops_sessions() {
+        let directory = Staging::create(&std::env::current_dir().unwrap()).unwrap();
+        let seed_directory = directory.0.join("seed");
+        let output = directory.0.join("download");
+        tokio::fs::create_dir(&seed_directory).await.unwrap();
+        let wanted = vec![42_u8; 16 * 1024];
+        tokio::fs::write(seed_directory.join("chosen.bin"), &wanted)
+            .await
+            .unwrap();
+        tokio::fs::write(
+            seed_directory.join("unselected.bin"),
+            vec![99_u8; 16 * 1024],
+        )
+        .await
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let tracker_address = listener.local_addr().unwrap();
+        let seed = SessionGuard(
+            Session::new_with_opts(
+                seed_directory.clone(),
+                SessionOptions {
+                    dht: None,
+                    disable_trackers: true,
+                    disable_local_service_discovery: true,
+                    ipv4_only: true,
+                    listen: Some(librqbit::ListenerOptions {
+                        listen_addr: "127.0.0.1:0".parse().unwrap(),
+                        ipv4_only: true,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        let (torrent, handle) = seed
+            .0
+            .create_and_serve_torrent(
+                &seed_directory,
+                librqbit::CreateTorrentOptions {
+                    name: Some("Collection"),
+                    trackers: vec![format!("http://{tracker_address}/announce")],
+                    piece_length: Some(16 * 1024),
+                },
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), handle.wait_until_completed())
+            .await
+            .unwrap()
+            .unwrap();
+        let index = handle
+            .with_metadata(|metadata| {
+                metadata
+                    .info
+                    .iter_file_details()
+                    .position(|file| file.filename.to_string() == "chosen.bin")
+                    .unwrap()
+            })
+            .unwrap();
+        let _tracker = LocalTracker::start(
+            listener,
+            torrent.as_bytes().unwrap().to_vec(),
+            seed.0.listen_addr().unwrap(),
+        );
+        let mut url = Url::parse("rgsx+torrent://download").unwrap();
+        url.query_pairs_mut()
+            .append_pair(
+                "source",
+                &format!("http://{tracker_address}/manifest.torrent"),
+            )
+            .append_pair("path", "Collection/chosen.bin")
+            .append_pair("index", &(index + 1).to_string())
+            .append_pair("size", &wanted.len().to_string());
+        let client = reqwest::Client::new();
+        let stopped = seed.0.cancellation_token().child_token();
+        let mut progress = Vec::new();
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            download_with_options(
+                &client,
+                url.as_str(),
+                &output,
+                "renamed.bin",
+                |bytes| progress.push(bytes),
+                SessionOptions {
+                    dht: None,
+                    disable_local_service_discovery: true,
+                    cancellation_token: Some(stopped.clone()),
+                    ..Default::default()
+                },
+                Duration::from_secs(10),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result, output.canonicalize().unwrap().join("renamed.bin"));
+        assert_eq!(tokio::fs::read(result).await.unwrap(), wanted);
+        assert_eq!(std::fs::read_dir(&output).unwrap().count(), 1);
+        assert_eq!(progress.last(), Some(&(wanted.len() as u64)));
+        assert!(progress.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert!(
+            stopped.is_cancelled(),
+            "Downloader must stop before returning"
+        );
+        assert_eq!(handle.stats().uploaded_bytes, wanted.len() as u64);
+
+        seed.0.stop().await;
+        assert!(seed.0.cancellation_token().is_cancelled());
+        let stalled_options = SessionOptions {
+            dht: None,
+            disable_local_service_discovery: true,
+            cancellation_token: Some(Default::default()),
+            ..Default::default()
+        };
+        let stalled = stalled_options.cancellation_token.as_ref().unwrap().clone();
+        // A stopped seed advertised by a tracker must not occupy the download slot forever.
+        let error = tokio::time::timeout(
+            Duration::from_secs(10),
+            download_with_options(
+                &client,
+                url.as_str(),
+                &output,
+                "no-peers.bin",
+                |_| {},
+                stalled_options,
+                Duration::from_millis(100),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("no reachable peers"),
+            "{error:#}"
+        );
+        assert!(!output.join("no-peers.bin").exists());
+        assert_eq!(std::fs::read_dir(&output).unwrap().count(), 1);
+        assert!(stalled.is_cancelled());
     }
 }

@@ -94,6 +94,18 @@ struct Game {
         alias = "thumbnail"
     )]
     artwork_url: String,
+    #[serde(default, deserialize_with = "deserialize_metadata")]
+    metadata_json: serde_json::Value,
+}
+
+fn deserialize_metadata<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<serde_json::Value, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(match value {
+        serde_json::Value::String(text) => serde_json::from_str(&text).unwrap_or_default(),
+        value => value,
+    })
 }
 
 #[tokio::main]
@@ -209,7 +221,17 @@ async fn download_release(
 ) -> Result<PathBuf> {
     validate_download(&game.url)?;
     if torrent::is_torrent(&game.url) {
-        return torrent::download(client, &game.url, output, &game.name, on_progress).await;
+        if overwrite {
+            bail!("--overwrite is not supported for native torrent downloads");
+        }
+        return torrent::download(
+            client,
+            &game.url,
+            output,
+            &safe_filename(&game.name),
+            on_progress,
+        )
+        .await;
     }
     let resolved = debrid::resolve(client, settings, &game.url).await?;
     let resolved_game = Game {
@@ -1260,6 +1282,67 @@ mod tests {
             b"test file"
         );
         server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn release_dispatcher_validates_legacy_torrents_before_rejecting_overwrite() {
+        let directory = TestDirectory::new();
+        let client = reqwest::Client::new();
+        for (url, expected) in [
+            (
+                "rgsx+torrent://unsupported",
+                "Invalid legacy torrent download URL",
+            ),
+            (
+                "rgsx+torrent://download?source=http%3A%2F%2F127.0.0.1%3A1%2Funused.torrent&path=folder%2Fgame.zip&index=1",
+                "--overwrite is not supported for native torrent downloads",
+            ),
+        ] {
+            let game = Game {
+                name: "folder/game.zip".to_owned(),
+                url: url.to_owned(),
+                ..Default::default()
+            };
+            let error = download_release(
+                &client,
+                &game,
+                &directory.0,
+                true,
+                &debrid::Settings::default(),
+                |_| panic!("Rejected torrent must not start transferring"),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.to_string(), expected);
+            assert_eq!(std::fs::read_dir(&directory.0).unwrap().count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn release_dispatcher_sanitizes_legacy_torrent_destination() {
+        let directory = TestDirectory::new();
+        std::fs::write(directory.0.join("game.zip"), b"original").unwrap();
+        let game = Game {
+            name: r"..\folder\game.zip".to_owned(),
+            url: "rgsx+torrent://download?source=http%3A%2F%2F127.0.0.1%3A1%2Funused.torrent&path=folder%2Fgame.zip&index=1".to_owned(),
+            ..Default::default()
+        };
+        let error = download_release(
+            &reqwest::Client::new(),
+            &game,
+            &directory.0,
+            false,
+            &debrid::Settings::default(),
+            |_| panic!("Existing destination must not start transferring"),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("Destination already exists"));
+        assert_eq!(
+            std::fs::read(directory.0.join("game.zip")).unwrap(),
+            b"original"
+        );
+        assert_eq!(std::fs::read_dir(&directory.0).unwrap().count(), 1);
     }
 
     #[tokio::test]
