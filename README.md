@@ -1,8 +1,49 @@
 # 🎮 Retro Game Sets Xtra (RGSX)
 
-**[Discord Support](https://discord.gg/XPK8YG8XYC)** • **[Installation](#-installation)** • **[French Documentation](https://github.com/RetroGameSets/RGSX/blob/main/README_FR.md)** • **[Turkish Documentation](https://github.com/RetroGameSets/RGSX/blob/main/README_TR.md)** • **[Troubleshoot / Common Errors](https://github.com/RetroGameSets/RGSX#%EF%B8%8F-troubleshooting)** •
+**[Standalone app](#standalone-rust-app)** • **[Windows downloads](https://github.com/coreylad/RGSX/releases)** • **[Legacy installation](#-installation)** • **[Discord Support](https://discord.gg/XPK8YG8XYC)**
 
-A free, user-friendly ROM downloader for Batocera, Knulli, and RetroBat with multi-source support.
+This repository contains a standalone, cross-platform **Rust catalog browser and direct downloader**, alongside the original **Python RGSX application** for Batocera, Knulli, and RetroBat.
+
+## Project scope
+
+| Application | Location | Current capabilities |
+|-------------|----------|----------------------|
+| Standalone Rust app | [`rust-app/`](rust-app/) | Native desktop GUI and optional CLI; browse platforms, list/search games, and download direct HTTP(S) links without Python, Batocera, or EmulationStation. |
+| Legacy Python app | [`ports/RGSX/`](ports/RGSX/), [`windows/`](windows/) | Controller-oriented interface, web interface, premium/debrid integrations, torrents, and emulator-system integration. |
+
+The Rust app is not yet a feature-complete replacement for the Python app. It does **not** currently provide its web server, controller-first interface, premium/debrid integrations, torrent backend, or Batocera-specific features. Catalog browsing needs an Internet connection; downloads require direct HTTP(S) URLs.
+
+## Standalone Rust app
+
+### Windows executable
+
+1. Open this fork's [Releases page](https://github.com/coreylad/RGSX/releases).
+2. Choose a **Standalone Windows** prerelease and download `rgsx.exe`.
+3. Run it to open the GUI, choose a platform, filter games, set a download folder, and start a download.
+
+No Python runtime or existing RGSX installation is required. The automated executable targets **64-bit Windows (x86-64)**. These are development builds, not stable releases; use only content you are authorized to download.
+
+The [Windows build workflow](.github/workflows/build-windows.yml) runs on **every branch and tag push**, as well as manually. It checks formatting, runs the Rust tests, and builds a release executable using the committed lockfile. Successful builds are available as workflow artifacts and as GitHub prereleases tagged `rust-<full-commit-SHA>`. Rebuilding the same commit updates its executable rather than creating another release. Prereleases do not replace the legacy app's stable “latest” release; use the Releases page rather than `/releases/latest`.
+
+### Build from source (Windows, Linux, macOS)
+
+Install the [Rust toolchain](https://rustup.rs/), then run from the repository root:
+
+```sh
+cd rust-app
+cargo build --release --locked
+cargo run --release --locked
+```
+
+The executable is `rust-app/target/release/rgsx.exe` on Windows or `rust-app/target/release/rgsx` on Linux/macOS. Linux may require X11 or Wayland development/runtime libraries.
+
+Running without arguments opens the GUI. Run `rgsx --help` (or `.\rgsx.exe --help` on Windows) for CLI commands. See the [Rust app documentation](rust-app/README.md) for CLI usage and catalog endpoint configuration.
+
+## Legacy Python application
+
+**Everything below describes the original Python application**, not the standalone Rust executable. Existing installation scripts and upstream ZIP downloads install that application. The screenshots also show the Python application.
+
+Legacy translations: [French](README_FR.md) • [Turkish](README_TR.md). These do not yet cover the standalone Rust app.
 
 <p align="center">
   <img width="49%" alt="RGSX Web platform list" src="screenshots/platforms-web.png" />
